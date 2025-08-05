@@ -53,19 +53,19 @@ echo USB drive "%driveletter%" has been formatted with GPT and FAT32.
 echo.
 timeout /t 2 /nobreak >nul
 
-rem cls
-echo Splitting AOS image...
-powershell.exe -ExecutionPolicy Bypass -NoProfile -Command "& { $path = Get-ChildItem '%isodriveletter%\images\svm\nutanix_installer_package*'; $chunkSize = 2147483000; $reader = [System.IO.File]::OpenRead($path); $count = 0; $buffer = New-Object Byte[] $chunkSize; $hasMore = $true; New-Item -Path '%driveletter%\images\svm\' -ItemType Directory -Force | Out-Null; while($hasMore) { $bytesRead = $reader.Read($buffer, 0, $buffer.Length); if ($bytesRead -eq 0) { break; }; $chunkFileName = '%driveletter%\images\svm\nutanix_installer_package.tar.p{0:D2}'; $chunkFileName = $chunkFileName -f $count; $output = $buffer; if ($bytesRead -ne $buffer.Length) { $hasMore = $false; $output = New-Object Byte[] $bytesRead; [System.Array]::Copy($buffer, $output, $bytesRead); }; [System.IO.File]::WriteAllBytes($chunkFileName, $output); Write-Host ('Chunk created: ' + $chunkFileName); ++$count; }; $reader.Close(); }"
-echo Splitting completed.
-echo.
-timeout /t 2 /nobreak >nul
-
 :Copy
 rem cls
 echo Copying image...
 echo \images\svm >> %excludelist%
 xcopy /E /I /H /R /Y /J "%isodriveletter%\*" %driveletter% /exclude:%excludelist%
 echo Copy completed.
+echo.
+timeout /t 2 /nobreak >nul
+
+rem cls
+echo Splitting AOS image...
+powershell.exe -ExecutionPolicy Bypass -NoProfile -Command "& { $path = Get-ChildItem '%isodriveletter%\images\svm\nutanix_installer_package*'; $chunkSize = 2147483000; $reader = [System.IO.File]::OpenRead($path); $count = 0; $buffer = New-Object Byte[] $chunkSize; $hasMore = $true; New-Item -Path '%driveletter%\images\svm\' -ItemType Directory -Force | Out-Null; while($hasMore) { $bytesRead = $reader.Read($buffer, 0, $buffer.Length); if ($bytesRead -eq 0) { break; }; $chunkFileName = '%driveletter%\images\svm\nutanix_installer_package.tar.p{0:D2}'; $chunkFileName = $chunkFileName -f $count; $output = $buffer; if ($bytesRead -ne $buffer.Length) { $hasMore = $false; $output = New-Object Byte[] $bytesRead; [System.Array]::Copy($buffer, $output, $bytesRead); }; [System.IO.File]::WriteAllBytes($chunkFileName, $output); Write-Host ('Chunk created: ' + $chunkFileName); ++$count; }; $reader.Close(); }"
+echo Splitting completed.
 echo.
 timeout /t 2 /nobreak >nul
 
