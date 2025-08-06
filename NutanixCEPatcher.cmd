@@ -81,7 +81,7 @@ timeout /t 2 /nobreak >nul
 
 if %createiso%==Y (
 	echo Creating ISO file...
-	%~dp0oscdimg.exe -m -o -u2 -udfver102 -lPHOENIX -bootdata:2#p0,e,b%driveletter%\boot\isolinux\isolinux.bin#pEF,e,b%driveletter%\boot\images\efiboot.img %driveletter% %~dp0nutanix.iso
+	%~dp0oscdimg.exe -m -o -n -d -lPHOENIX -bootdata:2#p0,e,b%driveletter%\boot\isolinux\isolinux.bin#pEF,e,b%driveletter%\boot\images\efiboot.img %driveletter% %~dp0nutanix.iso
 )
 
 rem cls
