@@ -26,7 +26,7 @@ set /p createiso=Do you want to create an ISO [Y/N]:
 if %createiso%==Y (
 	set driveletter=%TMP%\nutanix-%RANDOM%
 	echo.
-	goto :Copy
+	goto :copy
 )
 
 set /p driveletter=Please enter the drive letter of the USB drive: 
@@ -48,16 +48,18 @@ echo select partition 1 >> %bulkpart%
 echo format fs=fat32 label=PHOENIX quick >> %bulkpart%
 echo assign letter=%driveletter% >> %bulkpart%
 diskpart /s %bulkpart%
+del /q %bulkpart%
 echo.
 echo USB drive "%driveletter%" has been formatted with GPT and FAT32.
 echo.
 timeout /t 2 /nobreak >nul
 
-:Copy
+:copy
 rem cls
 echo Copying image...
 echo \images\svm >> %excludelist%
 xcopy /E /I /H /R /Y /J "%isodriveletter%\*" %driveletter% /exclude:%excludelist%
+del /q %excludelist%
 echo Copy completed.
 echo.
 timeout /t 2 /nobreak >nul
@@ -81,7 +83,8 @@ timeout /t 2 /nobreak >nul
 
 if %createiso%==Y (
 	echo Creating ISO file...
-	%~dp0oscdimg.exe -m -o -u1 -udfver102 -lPHOENIX -bootdata:2#p0,e,b%driveletter%\boot\isolinux\isolinux.bin#pEF,e,b%driveletter%\boot\images\efiboot.img %driveletter% %~dp0nutanix.iso
+	%~dp0oscdimg.exe -m -o -n -d -lPHOENIX -bootdata:2#p0,e,b%driveletter%\boot\isolinux\isolinux.bin#pEF,e,b%driveletter%\boot\images\efiboot.img %driveletter% %~dp0nutanix.iso
+	rd /s /q %driveletter%
 )
 
 rem cls
