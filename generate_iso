@@ -1,0 +1,491 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2017 Nutanix Inc. All rights reserved.
+#
+# Author: piyush.mittal@nutanix.com
+#
+#  Useful for generating various kinds of isos.
+#
+import py2_to_py39
+py2_to_py39.execute_with_python39(__file__)
+
+import logging
+import os
+import shutil
+import sys
+import argparse
+import tarfile
+import uuid
+from foundation import kvm_prep
+from foundation import folder_central
+from foundation import foundation_tools
+from foundation import phoenix_prep
+from foundation import shared_functions
+from foundation import features
+from string import Template
+from driver_utils import generate_package as gp
+
+LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+logging.basicConfig(format=LOG_FORMAT, level=logging.DEBUG)
+
+default_logger = logging.getLogger("generate_iso")
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter(LOG_FORMAT))
+handler.setLevel(logging.DEBUG)
+default_logger.addHandler(handler)
+default_logger.propagate = False
+
+# ENG-130052 - Make sure all tmp is under /home/nutanix/foundation
+os.environ["TMPDIR"] = folder_central.get_garbage_dir()
+os.environ["PYTHON_EGG_CACHE"] = folder_central.get_python_eggs_cache_dir()
+
+ARCH_PPC = 'ppc64le'
+ARCH_X86 = 'x86_64'
+BOND_MODES = ['dynamic', 'static', 'static_port_channel']
+BOND_LACP_RATES = ['fast', 'slow']
+SUPPORTED_MODES = ['Installer', 'RescueShell', 'NDPRescueShell']
+SUPPORTED_ARCHS = [ARCH_PPC, ARCH_X86]
+DEFAULT_BOOT_DELAY = '1'
+
+class Options(object):
+    pass
+
+def get_foundation_version():
+    """
+  Returns the current foundation version.
+  """
+    version = foundation_tools.read_foundation_version()
+    return version if version else 'unknown_version'
+
+def update_phoenix_boot_args(options, phoenix_dir):
+    """
+  Updates phoenix boot confs with boot args based on input options
+
+  Args:
+    options (Options): Input options for generating phoenix
+    phoenix_dir (string): Directory with phoenix
+
+  Returns:
+    None
+  """
+    _get_lacp_rate = lambda x: 4 if x == 'dynamic' else 6 if x == 'static_port_channel' else 0
+    _get_bond_mode = lambda x: 4 if x == 'dynamic' else 6 if x == 'static_port_channel' else 0
+    _get_bond_uplinks = lambda x: ','.join(x) if x else ''
+
+    def _get_arg_string(arg_name, value):
+        return '='.join([arg_name, str(value)])
+
+    def _update_phoenix_boot_confs(additional_args, phoenix_dir):
+        cmd_to_append = ' '.join(additional_args)
+        boot_conf_init_regex_map = [('boot/isolinux/isolinux.cfg', 'append initrd'), ('EFI/BOOT/grub.cfg', 'linuxefi'), ('grub.cfg', 'linux')]
+        for boot_file, regex in boot_conf_init_regex_map:
+            boot_file_path = os.path.join(phoenix_dir, boot_file)
+            if os.path.exists(boot_file_path):
+                lines = []
+                with open(boot_file_path, 'r') as fd:
+                    for line in fd:
+                        if regex in line:
+                            line = line.strip('\n') + ' ' + cmd_to_append
+                        lines.append(line.strip('\n'))
+                with open(boot_file_path, 'w') as fd:
+                    fd.write('\n'.join(lines))
+    key_args_value_map = [('ip', 'PHOENIX_IP', lambda x: x), ('netmask', 'MASK', lambda x: x), ('gateway', 'GATEWAY', lambda x: x), ('vlan', 'VLAN', lambda x: x), ('bond_uplinks', 'BOND_UPLINKS', _get_bond_uplinks), ('test_ip', 'FOUND_IP', lambda x: x), ('ntp_servers', 'NTP_SERVERS', lambda x: x), ('nameservers', 'NAMESERVER', lambda x: x), ('node_uuid', 'NODE_UUID', lambda x: x)]
+    if hasattr(options, 'use_cvm_config') and options.use_cvm_config:
+        key_args_value_map.append(('use_cvm_config', 'USE_CVM_CFG', lambda x: 'true'))
+    additional_args = []
+    for key, arg_name, func in key_args_value_map:
+        value = getattr(options, key, None)
+        if value is not None:
+            additional_args.append(_get_arg_string(arg_name, func(value)))
+    if additional_args:
+        _update_phoenix_boot_confs(additional_args, phoenix_dir)
+
+def generate_phoenix_iso(options, logger, genesis=False):
+    """
+  Generates a phoenix iso.
+
+  Args:
+    options: Input options for generating iso.
+    logger: Logger object.
+
+  Raises:
+    Exception if any invalid option is provided.
+
+  Returns:
+    Path to iso if successful. Otherwise None is returned.
+  """
+    if options.aos_package:
+        nos_package = os.path.expanduser(options.aos_package)
+        if not os.path.exists(nos_package):
+            logger.error("Couldn't find the AOS package at %s" % nos_package)
+            return
+        if not shared_functions.validate_aos_package(nos_package):
+            logger.error('Given AOS package is not a valid AOS package')
+            return
+        nos_pkg_arch = shared_functions.get_nos_package_arch_from_tarball(nos_package)
+        if nos_pkg_arch and nos_pkg_arch != options.arch:
+            logger.error('%s type nodes can be imaged only with %s specific AOS package, but the AOS package provided is meant for nodes of architecture: %s' % (options.arch, options.arch, nos_pkg_arch))
+            return
+    else:
+        nos_package = None
+    if not os.path.exists(options.temp_dir):
+        logger.error('The temporary dir specified %s does not exist' % options.temp_dir)
+        return
+    if not os.path.isdir(options.temp_dir):
+        logger.error('The temporary dir specified %s is not a dir' % options.temp_dir)
+        return
+    if options.mode not in SUPPORTED_MODES:
+        logger.error("Unsupported mode '%s' is provided" % options.mode)
+        return
+    if options.timeout:
+        if int(options.timeout, 10) < 0:
+            logger.error('Invalid boot menu timeout value. Please specify a positive number')
+            return
+    else:
+        options.timeout = DEFAULT_BOOT_DELAY
+    if options.arch not in SUPPORTED_ARCHS:
+        logger.error("Unsupported arch '%s' is provided" % options.arch)
+        return
+    if options.arch == ARCH_PPC and (options.esx or options.hyperv or options.xen):
+        logger.error('Only AHV is supported on ppc64le')
+        return
+    if getattr(options, 'vlan', None) and options.vlan not in range(1, 4095):
+        logger.error('Vlan id %s is not >=1 and < 4095', options.vlan)
+        return
+    if getattr(options, 'ip', None) and (not getattr(options, 'test_ip', None)) and (not getattr(options, 'gateway', None)):
+        logger.error("Specify 'test_ip' to test phoenix connectivity")
+        return
+    if getattr(options, 'fc_config_url', None):
+        if options.mode != 'NDPRescueShell':
+            raise Exception("--mode must be 'NDPRescueShell' when --fc-config-url is passed")
+        if options.no_package_driver:
+            raise Exception('--no-package-driver is not allowed with --fc-config-url')
+    supported_vendors = ['cisco']
+    if getattr(options, 'vendor_type', None):
+        if options.vendor_type not in supported_vendors:
+            raise StandardError('Unsupported vendor type for ISO generation')
+    else:
+        options.vendor_type = None
+    if getattr(options, 'node_uuid', None):
+        if options.mode != 'NDPRescueShell':
+            raise Exception("Node UUID is supported only in 'NDPRescueShell' mode")
+        try:
+            uuid.UUID(options.node_uuid)
+        except ValueError:
+            raise Exception('Node UUID is not a valid UUID format')
+    phoenix_dir = folder_central.get_phoenix_dir(arch=options.arch)
+    if not os.path.exists(phoenix_dir):
+        logger.error("Couldn't find default phoenix at %s" % phoenix_dir)
+        return
+    if options.kvm:
+        kvm_path = os.path.expanduser(options.kvm)
+        if not os.path.exists(kvm_path):
+            logger.error("Couldn't find kvm package at %s" % kvm_path)
+            return
+        if kvm_path.endswith('.tar.gz'):
+            if options.arch == ARCH_PPC:
+                raise Exception('File type tar.gz not supported for arch ppc64le')
+            if not foundation_tools.validate_kvm_tar(kvm_path):
+                logger.error('Given KVM package is not a valid kvm package')
+                return
+            kvm_path = kvm_prep.generate_kvm_iso(kvm_path, options.temp_dir, logger)
+        elif not kvm_path.endswith('.iso'):
+            raise Exception('File type not supported. Supported formats are .tar.gz and .iso only. Download a new AHV tarball from the Nutanix portal.')
+        hypervisor = {'type': 'kvm', 'path': kvm_path}
+    elif options.hyperv:
+        hyperv_path = os.path.expanduser(options.hyperv)
+        if not os.path.exists(hyperv_path):
+            logger.error("Couldn't find hyperv package at %s" % hyperv_path)
+            return
+        hypervisor = {'type': 'hyperv', 'path': hyperv_path}
+    elif options.esx:
+        esx_path = os.path.expanduser(options.esx)
+        if not os.path.exists(esx_path):
+            logger.error("Couldn't find esx package at %s" % esx_path)
+            return
+        hypervisor = {'type': 'esx', 'path': esx_path}
+    elif options.xen:
+        xen_path = os.path.expanduser(options.xen)
+        if not os.path.exists(xen_path):
+            logger.error("Couldn't find xen package at %s" % xen_path)
+            return
+        hypervisor = {'type': 'xen', 'path': xen_path}
+    elif options.kvm_from_aos:
+        if not options.aos_package:
+            logger.error('AOS package is not provided. Provide an AOS package using --aos-package <path to AOS package>.')
+            return
+        if options.arch == ARCH_PPC:
+            logger.error('kvm_from_aos option is not supported for arch ppc64le.')
+            return
+        anaconda_tarball = folder_central.get_anaconda_tarball()
+        kvm_path = os.path.join(options.temp_dir, 'kvm.iso')
+        shared_functions.prepare_kvm_from_rpms(anaconda_tarball, kvm_path, nos_pkg_path=os.path.expanduser(options.aos_package))
+        hypervisor = {'type': 'kvm', 'path': kvm_path}
+    else:
+        hypervisor = None
+    if hypervisor and (not hypervisor['path'].endswith('.iso')):
+        raise Exception('File type not supported. hypervisor image file must ends with .iso (lowercase) as extension name.')
+    stat_data = os.statvfs(options.temp_dir)
+    partition_free_space = stat_data.f_bsize * stat_data.f_bavail
+    if nos_package:
+        nos_size = os.path.getsize(nos_package)
+    else:
+        nos_size = 0
+    phoenix_size = 104857600
+    if hypervisor:
+        hypervisor_size = os.path.getsize(hypervisor['path'])
+    else:
+        hypervisor_size = 0
+    if not options.skip_space_check:
+        size_threshold = 1.25 * (2.0 * (nos_size + phoenix_size + hypervisor_size))
+        if partition_free_space < size_threshold:
+            logger.error('Partition hosting target directory (%s) is low on free space (%.2f GB space remaining). Please specify a separate directory to write to with --temp-dir=/path . If you are confident ignoring this warning, you may skip the space check with --skip-space-check' % (options.temp_dir, 1.0 * partition_free_space / 1073741824))
+            return
+    image_dir = '%s/%s' % (options.temp_dir, str(uuid.uuid4()))
+    image_images_dir = os.path.join(image_dir, 'images')
+    try:
+        logger.info('Copying phoenix files to %s', image_dir)
+        shutil.copytree(phoenix_dir, image_dir)
+        features.load_features_from_json(folder_central.get_foundation_features_path())
+        distro = 'squashfs'
+        logger.info('Phoenix will run in %s mode.' % distro)
+        if not options.vendor_type:
+            logger.info('Copying phoenix updates to %s', image_dir)
+            updates_dir = phoenix_prep.create_phoenix_updates_dir(image_dir)
+            if any([features.is_enabled(feature) for feature in features.get_phoenix_pluggable_components()]):
+                phoenix_prep.copy_phoenix_components(updates_dir)
+            if features.is_enabled(features.PHOREST):
+                phoenix_prep.copy_phorest(updates_dir)
+        else:
+            logger.info('Skipping phoenix updates for vendor specific iso')
+        if options.notice:
+            notice_path = os.path.expanduser(options.notice)
+            if not os.path.exists(notice_path):
+                logger.error("Couldn't find notice file at %s" % notice_path)
+                return
+                logger.info('Done')
+            phoenix_prep.copy_notice_file(notice_path, image_dir)
+        vendor_list = []
+        if options.vendor_type:
+            vendor_list = [options.vendor_type]
+        if not genesis and (not options.arch == ARCH_PPC) and (not options.no_package_driver):
+            logger.info('Adding hypervisor drivers package')
+            os.makedirs(image_images_dir)
+            driver_pkg = os.path.join(image_images_dir, 'driver_package.tar.gz')
+            gp.generate_driver_package(driver_pkg, vendor_list=vendor_list)
+        iso_name = 'phoenix-%s' % get_foundation_version()
+        if nos_package:
+            nos_package_dst = image_dir + '/images/svm'
+            if not os.path.exists(nos_package_dst):
+                os.makedirs(nos_package_dst)
+            logger.info('Copying the AOS from %s to %s' % (nos_package, nos_package_dst))
+            shutil.copy(nos_package, nos_package_dst)
+            nos_archive = os.path.join(nos_package_dst, os.path.basename(nos_package))
+            try:
+                tf = tarfile.open(nos_archive, 'r:gz')
+                tf.close()
+                logger.info('Unzipping AOS %s' % nos_archive)
+                foundation_tools.system(['gunzip', nos_archive])
+                tar_path = os.path.splitext(nos_archive)[0]
+                chunk_size = 2147483000
+                logger.info('Splitting %s into chunks of %d bytes', tar_path, chunk_size)
+                count = 0
+                output_dir = os.path.dirname(tar_path)
+                chunk_base_name = 'nutanix_installer_package.tar'
+                with open(tar_path, 'rb') as f_in:
+                    while True:
+                        chunk = f_in.read(chunk_size)
+                        if not chunk:
+                            break
+                        chunk_file_name = os.path.join(output_dir, '%s.p%02d' % (chunk_base_name, count))
+                        with open(chunk_file_name, 'wb') as f_out:
+                            f_out.write(chunk)
+                        logger.info('Chunk created: %s', chunk_file_name)
+                        count += 1
+                logger.info('Removing original tar file: %s', tar_path)
+                os.remove(tar_path)
+            except tarfile.ReadError:
+                pass
+            iso_name += '_AOS'
+        if hypervisor:
+            hyp_dir = image_dir + '/images/hypervisor/%s' % hypervisor['type']
+            if not os.path.exists(hyp_dir):
+                os.makedirs(hyp_dir)
+            logger.info('Copying the hypervisor to phoenix')
+            shutil.copy(hypervisor['path'], hyp_dir)
+            iso_name += '-%s' % hypervisor['type']
+        update_phoenix_boot_args(options, image_dir)
+        iso_name += '-%s' % options.arch
+        logger.info('Preparing phoenix iso in %s mode with timeout %s' % (options.mode, options.timeout))
+        foundation_tools.system(['%s/make_iso.sh' % image_dir, iso_name, options.mode, options.timeout, options.arch, distro])
+        logger.info('%s.iso generated in %s/' % (iso_name, options.temp_dir))
+        iso_path = os.path.join(options.temp_dir, iso_name + '.iso')
+        return iso_path
+    except Exception:
+        logger.exception('Error while preparing phoenix iso')
+        return None
+    finally:
+        logger.info('Cleaning up')
+        if image_dir and os.path.exists(image_dir):
+            shutil.rmtree(image_dir)
+
+def generate_phoenix_iso_cli(options, logger):
+    """
+  Entry point for phoenix iso preparation from CLI.
+
+  Args:
+    options: CLI options for generating iso.
+  """
+    iso = generate_phoenix_iso(options, logger)
+    if not iso: # Corrected logic to exit with 1 on failure
+        sys.exit(1)
+    sys.exit(0)
+
+def generate_phoenix_iso_http(params, logger=None):
+    """
+  Entry point for phoenix iso preparation from rest api.
+
+  Args:
+    params: Dict of parameters for generating phoenix.
+    logger: Logger object.
+
+  Raises:
+    Exception if iso generation fails.
+
+  Returns:
+    Relative path to the tmp file server of foundation.
+  """
+    logger = logger or default_logger
+    if 'mode' not in params:
+        params['mode'] = 'NDPRescueShell'
+    if params['mode'] not in SUPPORTED_MODES:
+        raise Exception("Given mode '%s' is not supported" % params['mode'])
+    if 'arch' not in params:
+        params['arch'] = ARCH_X86
+    if params['arch'] not in SUPPORTED_ARCHS:
+        raise Exception("Given arch '%s' is not supported" % params['arch'])
+    if params.get('ip') and (not params.get('test_ip')):
+        raise Exception("Specify 'test_ip' to test phoenix connectivity")
+    if 'bond_mode' in params and params['bond_mode'] == 'dynamic' and ('bond_lacp_rate' not in params):
+        params['bond_lacp_rate'] = 'fast'
+    if 'timeout' not in params:
+        params['timeout'] = DEFAULT_BOOT_DELAY
+    options = Options()
+    required_params = ['aos_package', 'temp_dir', 'kvm', 'hyperv', 'esx', 'xen', 'kvm_from_aos', 'skip_space_check', 'mode', 'arch', 'ip', 'netmask', 'gateway', 'vlan', 'bond_mode', 'bond_lacp_rate', 'bond_uplinks', 'test_ip', 'timeout', 'notice']
+    for param in required_params:
+        setattr(options, param, params.get(param))
+    if params.get('nameservers', []):
+        setattr(options, 'nameservers', ','.join(params.get('nameservers')))
+    if params.get('ntp_servers', []):
+        setattr(options, 'ntp_servers', ','.join(params.get('ntp_servers')))
+    if params.get('node_uuid'):
+        setattr(options, 'node_uuid', params.get('node_uuid'))
+    temp_dir = folder_central.get_tmp_folder(session_id=None)
+    options.temp_dir = os.path.join(temp_dir, str(uuid.uuid4()))
+    os.mkdir(options.temp_dir)
+    options.skip_space_check = False
+    options.mode = params['mode']
+    options.arch = params['arch']
+    iso = generate_phoenix_iso(options, logger, genesis=True)
+    if not iso:
+        raise Exception('Failed to generate phoenix iso')
+    return iso
+
+def create_parser():
+  parser = argparse.ArgumentParser(description="Utility to generate bootable "
+                                               "iso for phoenix and kvm.")
+
+  subparsers = parser.add_subparsers()
+  phoenix_help = ("Generate a bootable phoenix iso containing a given AOS "
+                  "package and hypervisor iso.")
+  parser_phoenix = subparsers.add_parser(
+      "phoenix", help=phoenix_help, description=phoenix_help)
+  parser_phoenix.add_argument("--aos-package",
+                              help="AOS tarball to package inside phoenix")
+  parser_phoenix.add_argument("--temp-dir",
+                              default="/home/nutanix/foundation/tmp",
+                              help="Temporary dir to store the output")
+  parser_phoenix.add_argument("--skip-space-check",
+                              help="Skip checking partition space",
+                              action="store_true", default=False)
+  parser_phoenix.add_argument("--mode",
+                              default="Installer",
+                              choices=SUPPORTED_MODES,
+                              help="Default boot mode for phoenix")
+  parser_phoenix.add_argument("--timeout",
+                              default="1",
+                              help="Default boot menu timeout(secs) for phoenix")
+  parser_phoenix.add_argument("--arch", default="x86_64",
+                              choices=SUPPORTED_ARCHS,
+                              help="Architecture of node to be imaged")
+  parser_phoenix.add_argument("--notice", help="Notice file for phoenix")
+  parser_phoenix.add_argument("--ip", help="Phoenix IPv4 address")
+  parser_phoenix.add_argument("--netmask", help="Phoenix netmask")
+  parser_phoenix.add_argument("--gateway", help="Phoenix gateway")
+  parser_phoenix.add_argument("--vlan", type=int,
+                              help="Phoenix vlan id (between 0 and 4095)")
+  parser_phoenix.add_argument("--nameservers",
+                              help="Comma separated values of DNS servers")
+  parser_phoenix.add_argument("--ntp_servers",
+                              help="Comma separated values of NTP servers")
+  parser_phoenix.add_argument("--bond-mode",
+                              choices=BOND_MODES,
+                              help="static for LAG, dynamic for LACP")
+  parser_phoenix.add_argument("--bond-lacp-rate", default="fast",
+                              choices=BOND_LACP_RATES,
+                              help="slow or fast if lacp is used at switch")
+  parser_phoenix.add_argument("--bond-uplinks", action="append",
+                              help="Mac addresses of NICS in bond")
+  parser_phoenix.add_argument("--test-ip",
+                              help="IP to test connectivity from phoenix to")
+  parser_phoenix.add_argument("--no-package-driver",
+                              default=False, action='store_true',
+                              help="Don't package AHV, ESX, Hyperv, Xen driver")
+  parser_phoenix.add_argument("--use-cvm-config", action='store_true',
+                              help="Use network config file in CVM partition"
+                                   " to configure phoenix networking")
+  parser_phoenix.add_argument("--fc-config-url",
+                              help="URL to the json containing fc_ip and "
+                                   "api_key details")
+  parser_phoenix.add_argument("--vendor-type",
+                              help=("Generates a minimal vendor specific iso. "
+                                    "Currently supported vendors: 'cisco'"))
+  parser_phoenix.add_argument("--node-uuid",
+                              help=("Node UUID used in the Hypervisor boot "
+                                    "disk break-fix procedure in "
+                                    "NDPRescueShell mode. Required for a LUKS "
+                                    "enabled node"))
+
+  hyp_group = parser_phoenix.add_mutually_exclusive_group()
+  hyp_group.add_argument("--kvm", help="Path to the kvm iso or host bundle")
+  hyp_group.add_argument("--esx", help="Path to the esx iso")
+  hyp_group.add_argument("--hyperv", help="Path to the hyperv iso")
+  hyp_group.add_argument("--xen", help="Path to the xen iso")
+  hyp_group.add_argument("--kvm-from-aos", action="store_true",
+                         help="Provide this flag to use AHV rpm bundled with AOS provided "
+                         "with --aos-package. This option is not supported for ppc64le.")
+
+  parser_phoenix.set_defaults(func=(lambda options:
+                                    generate_phoenix_iso_cli(
+                                        options,
+                                        default_logger)))
+
+  kvm_help = ("Generate a bootable KVM iso from a given KVM RPM tarball."
+              "Not supported for ppc64le")
+  parser_kvm = subparsers.add_parser("kvm", help=kvm_help,
+                                     description=kvm_help)
+  parser_kvm.add_argument("kvm_path", help="Path to kvm host bundle")
+  parser_kvm.add_argument("--temp-dir",
+                          default="/home/nutanix/foundation/tmp",
+                          help="Temporary dir to store the output")
+  parser_kvm.set_defaults(func=(lambda options: kvm_prep.generate_kvm_iso(
+                                                  options.kvm_path,
+                                                  options.temp_dir,
+                                                  default_logger)))
+
+  return parser
+
+if __name__ == "__main__":
+  parser = create_parser()
+  args = parser.parse_args()
+  args.func(args)
