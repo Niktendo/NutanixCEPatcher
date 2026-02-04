@@ -998,9 +998,11 @@ class CEGui(object):
       self.dns_ip = TextEditor(self.window,y,x+35,
                                     "DNS Server:",
                                     gp.p_list.dns_ip,15)
+      # FIX FOR 1-NODE CLUSTER STATE PERSISTENCE
+      is_1node = getattr(gp.p_list, 'create_1node_cluster', False)
       self.create_1node = CheckBox(self.window,y,x,
                                    "Create single-node cluster?",
-                                   False,
+                                   is_1node,
                                    disable_if_unchecked=[self.dns_ip],
                                    hide_if_unchecked=[self.dns_ip])
       self.handler.add(self.create_1node)
