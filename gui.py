@@ -1327,7 +1327,8 @@ class Gui(object):
     def get_boot_devices(node_position):
       if node_position == ' ':
         return []
-      layout = get_layout(node_position)
+      # TODO: Use correct layout_type for diskless deployment.
+      layout = get_layout(node_number=node_position)
       boot_devices = get_possible_boot_devices_from_layout(layout)
       if boot_devices != None:
         return [(disk.dev, disk.dev) for disk in boot_devices]
